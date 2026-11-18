@@ -83,6 +83,8 @@
 .direction-editor{margin:14px 0;padding:14px 0;border-top:1px solid #273140;border-bottom:1px solid #273140}.direction-note{font-size:11px;line-height:1.45;color:var(--muted);margin:2px 0 10px;padding:8px 9px;background:#0d141d;border:1px solid #263243;border-radius:8px}.direction-layout{display:grid;grid-template-columns:132px minmax(0,1fr);gap:12px;align-items:center}.direction-layout canvas{width:132px;height:132px;background:#0a1017;border:1px solid #2b394b;border-radius:50%;display:block}.direction-controls label{margin-bottom:10px}.direction-presets{display:grid;grid-template-columns:repeat(3,34px);grid-template-areas:"ul u ur" "l r rgt" "dl d dr";gap:5px;justify-content:center;margin-top:7px}.direction-presets button{width:34px;height:30px;padding:0;border:1px solid #344257;border-radius:7px;background:#202b3a;color:#dce7f5;cursor:pointer;font-size:16px;line-height:1}.direction-presets button:hover{background:#2a3749;border-color:#5b8cff}.direction-presets button:nth-child(1){grid-area:ul}.direction-presets button:nth-child(2){grid-area:u}.direction-presets button:nth-child(3){grid-area:ur}.direction-presets button:nth-child(4){grid-area:l}.direction-presets button:nth-child(5){grid-area:rgt}.direction-presets button:nth-child(6){grid-area:dl}.direction-presets button:nth-child(7){grid-area:d}.direction-presets button:nth-child(8){grid-area:dr}@media(max-width:430px){.direction-layout{grid-template-columns:1fr}.direction-layout canvas{margin:0 auto}}
     .spawn-editor{margin-top:14px;padding-top:14px;border-top:1px solid #273140}.subsection-title{font-size:.72rem;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#7f91a8;margin-bottom:10px}.spawn-settings{display:none}.spawn-settings.active{display:block}.spawn-note{font-size:.78rem;line-height:1.45;color:#7f91a8;padding:7px 0 2px}.movement-editor{margin:14px 0;padding:14px 0;border-top:1px solid #273140;border-bottom:1px solid #273140}.movement-settings{display:none}.movement-settings.active{display:block}.movement-note{font-size:11px;line-height:1.45;color:var(--muted);margin:2px 0 10px;padding:8px 9px;background:#0d141d;border:1px solid #263243;border-radius:8px}.movement-settings label:last-child{margin-bottom:0}select{background:#10161f;color:#dce7f5;border:1px solid #344154;border-radius:7px;padding:6px 8px;min-width:132px;outline:none}select:focus{border-color:#4da3ff;box-shadow:0 0 0 2px rgba(77,163,255,.12)}
     @media(max-width:900px){#sidebar{width:360px}.btn{padding:7px 9px}}
+  
+    #startupError{display:none;position:fixed;left:16px;right:16px;bottom:16px;z-index:99999;background:#4a1616;color:#ffdada;border:1px solid #d85c5c;border-radius:8px;padding:12px 14px;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;box-shadow:0 8px 30px rgba(0,0,0,.45)}
   </style>
 </head>
 <body>
@@ -403,9 +405,39 @@
     </div>
   </div>
 
+  <div id="startupError"></div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "pixi.js": "https://cdn.jsdelivr.net/npm/pixi.js@8.22.0/dist/pixi.min.mjs"
+    }
+  }
+  </script>
+
   <script type="module">
-    import * as PIXI8 from 'https://esm.sh/pixi.js@8.22.0';
-    import * as Particles8 from 'https://esm.sh/pixi-v8-particles@0.1.3?deps=pixi.js@8.22.0';
+    const startupError = document.getElementById('startupError');
+    const showStartupError = (err) => {
+      console.error(err);
+      if(startupError){
+        startupError.style.display='block';
+        startupError.textContent='Pixi 8 editor startup error:\n' + (err?.stack || err?.message || String(err));
+      }
+    };
+
+    try {
+    async function importFirst(urls){
+      let lastErr=null;
+      for(const url of urls){
+        try { return await import(url); } catch(err){ lastErr=err; console.warn('Module import failed:',url,err); }
+      }
+      throw lastErr || new Error('Unable to load runtime modules');
+    }
+    const PIXI8 = await import('pixi.js');
+    const Particles8 = await importFirst([
+      'https://esm.sh/pixi-v8-particles@0.1.3?external=pixi.js',
+      'https://cdn.jsdelivr.net/npm/pixi-v8-particles@0.1.3/+esm'
+    ]);
 
     // Keep the rest of the editor API-shaped like the stable build, while the
     // actual runtime underneath is PixiJS 8.22 + a v8 particle-emitter port.
@@ -434,32 +466,80 @@
     const emitterContainer = new PIXI.Container();
     emitterContainer.position.set(app.screen.width/2, app.screen.height/2);
     emitterContainer.hitArea = new PIXI.Circle(0,0,20);
-    emitterContainer.interactive = true;
+    emitterContainer.eventMode = 'static';
     emitterContainer.cursor = 'pointer';
     app.stage.addChild(emitterContainer);
 
     // Visual spawn-area guide. Editor-only: never exported and never affects particles.
     const spawnGizmo = new PIXI.Graphics();
     spawnGizmo.eventMode = 'none';
-    spawnGizmo.interactive = false;
+    // eventMode='none' is the v8 interaction API; no legacy interactive flag needed.
     emitterContainer.addChild(spawnGizmo);
 
-    // Drag emitter (kept exactly as an editor feature)
-    function onDragStart(){ this.dragging=true; }
-    function onDragEnd(){ this.dragging=false; }
-    function onDragMove(e){
-      if(!this.dragging) return;
-      const p=e.getLocalPosition(this.parent);
-      this.position.set(p.x,p.y);
-      const ind = document.getElementById('emitterIndicator');
-      ind.style.left = p.x+'px';
-      ind.style.top  = p.y+'px';
+    // Drag emitter. PixiJS v8 changed pointermove to be local to the hit target,
+    // so a fast drag can outrun the emitter's small hitArea. During an active drag
+    // we subscribe to globalpointermove and track the pointerId until release.
+    let emitterDragPointerId = null;
+    let emitterDragOffsetX = 0;
+    let emitterDragOffsetY = 0;
+
+    function onDragStart(e){
+      if(emitterDragPointerId !== null) return;
+
+      emitterDragPointerId = e.pointerId;
+      this.dragging = true;
+      this.cursor = 'grabbing';
+
+      const p = e.getLocalPosition(this.parent);
+      emitterDragOffsetX = this.x - p.x;
+      emitterDragOffsetY = this.y - p.y;
+
+      // Keep receiving moves even after the pointer leaves the 20px emitter hitArea.
+      this.on('globalpointermove', onDragMove);
+      this.on('pointerup', onDragEnd);
+      this.on('pointerupoutside', onDragEnd);
+      this.on('pointercancel', onDragEnd);
+
+      // Browser-level capture makes the drag robust even if the pointer briefly
+      // leaves the canvas while the mouse button is still held.
+      try { app.canvas.setPointerCapture(e.pointerId); } catch(_) {}
     }
-    emitterContainer
-      .on('pointerdown', onDragStart)
-      .on('pointerup', onDragEnd)
-      .on('pointerupoutside', onDragEnd)
-      .on('pointermove', onDragMove);
+
+    function onDragEnd(e){
+      if(emitterDragPointerId === null) return;
+      if(e && e.pointerId != null && e.pointerId !== emitterDragPointerId) return;
+
+      const releasedPointerId = emitterDragPointerId;
+      emitterDragPointerId = null;
+      this.dragging = false;
+      this.cursor = 'pointer';
+
+      this.off('globalpointermove', onDragMove);
+      this.off('pointerup', onDragEnd);
+      this.off('pointerupoutside', onDragEnd);
+      this.off('pointercancel', onDragEnd);
+
+      try {
+        if(app.canvas.hasPointerCapture(releasedPointerId)){
+          app.canvas.releasePointerCapture(releasedPointerId);
+        }
+      } catch(_) {}
+    }
+
+    function onDragMove(e){
+      if(!this.dragging || e.pointerId !== emitterDragPointerId) return;
+
+      const p = e.getLocalPosition(this.parent);
+      const x = p.x + emitterDragOffsetX;
+      const y = p.y + emitterDragOffsetY;
+      this.position.set(x,y);
+
+      const ind = document.getElementById('emitterIndicator');
+      ind.style.left = x+'px';
+      ind.style.top  = y+'px';
+    }
+
+    emitterContainer.on('pointerdown', onDragStart);
 
     // -------------------------------------------------------------------------
     // Custom v5 behavior: one shared animation sequence, but each particle gets
@@ -470,7 +550,7 @@
       constructor(config){
         this.order = (PIXI.particles.behaviors && PIXI.particles.behaviors.BehaviorOrder) ? PIXI.particles.behaviors.BehaviorOrder.Normal : 2;
         this.textures = (config.textures || []).map(t =>
-          typeof t === 'string' ? PIXI.Texture.from(t) : t
+          typeof t === 'string' ? PIXI.Texture.WHITE : t
         );
         this.fpsMin = Math.max(1, Number(config.fpsMin) || 24);
         this.fpsMax = Math.max(this.fpsMin, Number(config.fpsMax) || this.fpsMin);
@@ -577,10 +657,25 @@
       if(asset && asset.objectUrl){ try { URL.revokeObjectURL(asset.objectUrl); } catch {} }
     }
 
-    function defaultTextureAssets(){
-      return [
-        makeTextureAsset('particle.png', PIXI.Texture.from('particle.png'))
-      ];
+    async function loadTextureFromUrl(url){
+      const src = /^(?:blob:|data:|https?:|file:)/i.test(String(url))
+        ? String(url)
+        : new URL(String(url), document.baseURI).href;
+      const img = new Image();
+      img.decoding = 'async';
+      await new Promise((resolve,reject)=>{
+        img.onload=()=>resolve();
+        img.onerror=()=>reject(new Error(`Failed to load texture: ${url}`));
+        img.src=src;
+      });
+      return PIXI.Texture.from(img);
+    }
+
+    async function defaultTextureAssets(){
+      let texture = PIXI.Texture.WHITE;
+      try { texture = await loadTextureFromUrl('particle.png'); }
+      catch(err){ console.warn('particle.png could not be loaded; using Texture.WHITE for preview.',err); }
+      return [ makeTextureAsset('particle.png', texture) ];
     }
 
     function cloneJson(value){ return JSON.parse(JSON.stringify(value)); }
@@ -651,7 +746,7 @@
 
     function getAssetTexture(i, name){
       const asset = (textureAssets[i] || []).find(a=>a.name===name);
-      return asset ? asset.texture : PIXI.Texture.from(name);
+      return asset ? asset.texture : PIXI.Texture.WHITE;
     }
 
     function getSequenceTexture(i, name, fallbackIndex){
@@ -659,7 +754,7 @@
       const idx = seq.frameNames.indexOf(name);
       if(idx >= 0 && seq.frames[idx]) return seq.frames[idx];
       if(seq.frames[fallbackIndex]) return seq.frames[fallbackIndex];
-      return PIXI.Texture.from(name);
+      return PIXI.Texture.WHITE;
     }
 
     // Export config stays string-based and portable. Runtime config resolves those
@@ -760,7 +855,7 @@
         if(!sameLoadedSequence){
           destroySequenceState(seq);
           seq.frameNames = nextNames;
-          seq.frames = seq.frameNames.map(n=>PIXI.Texture.from(n));
+          seq.frames = seq.frameNames.map(()=>PIXI.Texture.WHITE);
         }
         seq.enabled = true;
         seq.fpsMin = Math.max(1, Number(randomAnim.config.fpsMin) || 24);
@@ -778,7 +873,7 @@
         if(!sameLoadedSequence){
           destroySequenceState(seq);
           seq.frameNames = nextNames;
-          seq.frames = seq.frameNames.map(n=>PIXI.Texture.from(n));
+          seq.frames = seq.frameNames.map(()=>PIXI.Texture.WHITE);
         }
         seq.enabled = true;
         seq.fpsMin = seq.fpsMax = Math.max(1, Number(anim.framerate) || 24);
@@ -801,7 +896,7 @@
           current.every((asset, idx)=>asset.name===staticNames[idx]);
         if(!sameLoadedTextures){
           current.forEach(destroyTextureAsset);
-          textureAssets[i] = staticNames.map(n=>makeTextureAsset(n, PIXI.Texture.from(n)));
+          textureAssets[i] = staticNames.map(n=>makeTextureAsset(n, PIXI.Texture.WHITE));
         }
       }
     }
@@ -1160,42 +1255,37 @@
       g.clear();
       if(selectedIndex < 0 || spawnGizmoVisible[selectedIndex] === false) return;
       const lineColor=0x55aaff, fillColor=0x55aaff;
-      g.lineStyle(1, lineColor, .72);
-      g.beginFill(fillColor,.045);
+      const stroke=(alpha=.72)=>({width:1,color:lineColor,alpha});
+      const fill={color:fillColor,alpha:.045};
 
       if(values.spawnType==='circle'){
-        g.drawCircle(0,0,Math.max(0,values.spawnCircleR));
+        g.circle(0,0,Math.max(0,values.spawnCircleR)).fill(fill).stroke(stroke());
       } else if(values.spawnType==='ring'){
         const outer=Math.max(0,values.spawnRingOuter);
         const inner=Math.max(0,Math.min(values.spawnRingInner,outer));
-        g.drawCircle(0,0,outer);
-        g.endFill();
-        g.lineStyle(1,lineColor,.45);
-        if(inner>0) g.drawCircle(0,0,inner);
+        g.circle(0,0,outer).stroke(stroke());
+        if(inner>0) g.circle(0,0,inner).stroke(stroke(.45));
       } else if(values.spawnType==='rect'){
         const w=Math.max(0,values.spawnRectW), h=Math.max(0,values.spawnRectH);
-        g.drawRect(values.spawnRectX-w/2,values.spawnRectY-h/2,w,h);
+        g.rect(values.spawnRectX-w/2,values.spawnRectY-h/2,w,h).fill(fill).stroke(stroke());
       } else if(values.spawnType==='burst'){
         const dist=Math.max(0,values.spawnBurstDistance);
         const count=Math.min(36,Math.max(1,Math.round(values.spawnBurstParticles)));
         const start=values.spawnBurstStart*Math.PI/180;
         const spacing=values.spawnBurstSpacing*Math.PI/180;
-        g.endFill();
-        if(dist>0){ g.lineStyle(1,lineColor,.35); g.drawCircle(0,0,dist); }
-        g.lineStyle(1,lineColor,.72);
+        if(dist>0) g.circle(0,0,dist).stroke(stroke(.35));
         const ray=Math.max(26,dist+28);
         for(let i=0;i<count;i++){
           const a=start+spacing*i;
           const x0=Math.cos(a)*dist, y0=Math.sin(a)*dist;
           const x1=Math.cos(a)*ray, y1=Math.sin(a)*ray;
-          g.moveTo(x0,y0); g.lineTo(x1,y1);
+          g.moveTo(x0,y0).lineTo(x1,y1).stroke(stroke());
         }
       } else {
-        g.endFill();
-        g.moveTo(-8,0);g.lineTo(8,0);g.moveTo(0,-8);g.lineTo(0,8);
-        g.drawCircle(0,0,3);
+        g.moveTo(-8,0).lineTo(8,0).stroke(stroke());
+        g.moveTo(0,-8).lineTo(0,8).stroke(stroke());
+        g.circle(0,0,3).stroke(stroke());
       }
-      try { g.endFill(); } catch {}
     }
 
     function normalizeDirectionAngle(angle){
@@ -1604,7 +1694,7 @@ export { RandomizedAnimatedTextureBehavior };\n`;
           const blob=assetsByName.get(name);
           if(!blob) continue;
           const url=URL.createObjectURL(blob);
-          const tx=PIXI.Texture.from(url);
+          const tx=await loadTextureFromUrl(url);
           if(seqSet.has(name)){
             seqState.frameNames.push(name); seqState.frames.push(tx); seqState.urls.push(url); seqState.blobs.push(blob);
           }else{
@@ -1656,7 +1746,7 @@ export { RandomizedAnimatedTextureBehavior };\n`;
         const item=document.createElement('div');
         item.className='textureItem';
         const img=document.createElement('img');
-        try { img.src=asset.texture.baseTexture.resource.url||asset.objectUrl||asset.name; } catch { img.src=asset.objectUrl||asset.name; }
+        img.src=asset.objectUrl||asset.name;
         img.title=asset.name;
         const name=document.createElement('div');
         name.textContent=asset.name;
@@ -1674,8 +1764,8 @@ export { RandomizedAnimatedTextureBehavior };\n`;
     }
 
     // Initial emitter.json: supports both old v4 JSON and production v5 JSON.
-    function initializeFirstEmitter(raw){
-      textureAssets.push(defaultTextureAssets());
+    async function initializeFirstEmitter(raw){
+      textureAssets.push(await defaultTextureAssets());
       names.push('Emitter 1');
       sequences.push(makeSequenceState());
       spawnGizmoVisible.push(true);
@@ -1689,8 +1779,8 @@ export { RandomizedAnimatedTextureBehavior };\n`;
 
     fetch('emitter.json')
       .then(r=>{ if(!r.ok) throw new Error('No emitter.json'); return r.json(); })
-      .then(initializeFirstEmitter)
-      .catch(()=>initializeFirstEmitter(makeDefaultV5Config()));
+      .then(raw=>initializeFirstEmitter(raw))
+      .catch(err=>{ console.warn('emitter.json unavailable, using default config.',err); return initializeFirstEmitter(makeDefaultV5Config()); });
 
     // JSON import modal
     const jsonModal=document.getElementById('jsonModal');
@@ -1699,10 +1789,10 @@ export { RandomizedAnimatedTextureBehavior };\n`;
     document.getElementById('jsonFileInput').onchange=function(){
       const f=this.files[0]; if(!f) return;
       const reader=new FileReader();
-      reader.onload=e=>{
+      reader.onload=async e=>{
         try{
           const raw=JSON.parse(e.target.result);
-          const assets=defaultTextureAssets();
+          const assets=await defaultTextureAssets();
           textureAssets.push(assets);
           names.push(f.name.replace(/\.json$/i,'') || `Emitter ${configs.length+1}`);
           sequences.push(makeSequenceState());
@@ -1723,13 +1813,13 @@ export { RandomizedAnimatedTextureBehavior };\n`;
     const texModal=document.getElementById('textureModal');
     document.getElementById('openTextureModalBtn').onclick=()=>texModal.style.display='flex';
     texModal.querySelector('.close').onclick=()=>texModal.style.display='none';
-    document.getElementById('addTextureConfirmBtn').onclick=()=>{
+    document.getElementById('addTextureConfirmBtn').onclick=async()=>{
       const fi=document.getElementById('textureFileInput');
       const file=fi.files[0];
       if(file && selectedIndex>=0){
         const url=URL.createObjectURL(file);
         const existing=(textureAssets[selectedIndex]||[]).findIndex(a=>a.name===file.name);
-        const nextAsset=makeTextureAsset(file.name,PIXI.Texture.from(url),url,file);
+        const nextAsset=makeTextureAsset(file.name,await loadTextureFromUrl(url),url,file);
         if(existing>=0){
           destroyTextureAsset(textureAssets[selectedIndex][existing]);
           textureAssets[selectedIndex][existing]=nextAsset;
@@ -1765,19 +1855,19 @@ export { RandomizedAnimatedTextureBehavior };\n`;
       updateConfigText();
     }
 
-    document.getElementById('sequenceFiles').addEventListener('change',function(){
+    document.getElementById('sequenceFiles').addEventListener('change',async function(){
       const files=Array.from(this.files||[]);
       if(!files.length || selectedIndex<0) return;
       files.sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:'base'}));
       const seq=getSequenceState(selectedIndex);
       destroySequenceState(seq);
-      files.forEach(file=>{
+      for(const file of files){
         const url=URL.createObjectURL(file);
         seq.urls.push(url);
         seq.blobs.push(file);
         seq.frameNames.push(file.name);
-        seq.frames.push(PIXI.Texture.from(url));
-      });
+        seq.frames.push(await loadTextureFromUrl(url));
+      }
       seq.enabled=true;
       commitSequenceSettings(); updateSequenceUI();
       this.value='';
@@ -1824,10 +1914,10 @@ export { RandomizedAnimatedTextureBehavior };\n`;
       return `${base} ${n}`;
     }
 
-    function createFreshEmitter(){
+    async function createFreshEmitter(){
       const cfg=cloneJson(standardEmitterTemplate || makeDefaultV5Config());
       configs.push(cfg);
-      textureAssets.push(defaultTextureAssets());
+      textureAssets.push(await defaultTextureAssets());
       names.push(nextEmitterName('Emitter'));
       sequences.push(makeSequenceState());
       spawnGizmoVisible.push(true);
@@ -1838,49 +1928,50 @@ export { RandomizedAnimatedTextureBehavior };\n`;
       refreshEmitterList(); populateForm(); updateTextureList(); updateSequenceUI(); updateConfigText();
     }
 
-    function cloneTextureAssetsForEmitter(sourceAssets){
-      return (sourceAssets||[]).map(a=>{
+    async function cloneTextureAssetsForEmitter(sourceAssets){
+      return Promise.all((sourceAssets||[]).map(async a=>{
         if(a.blob){
           const url=URL.createObjectURL(a.blob);
-          return makeTextureAsset(a.name,PIXI.Texture.from(url),url,a.blob);
+          return makeTextureAsset(a.name,await loadTextureFromUrl(url),url,a.blob);
         }
         // Built-in / externally addressed textures do not own an object URL.
         return makeTextureAsset(a.name,a.texture,null,null);
-      });
+      }));
     }
 
-    function cloneSequenceStateForEmitter(srcSeq){
+    async function cloneSequenceStateForEmitter(srcSeq){
       const seq=makeSequenceState();
       seq.enabled=srcSeq.enabled;
       seq.fpsMin=srcSeq.fpsMin;
       seq.fpsMax=srcSeq.fpsMax;
       seq.randomStart=srcSeq.randomStart;
       seq.loop=srcSeq.loop;
-      (srcSeq.frameNames||[]).forEach((name,idx)=>{
+      for(let idx=0; idx<(srcSeq.frameNames||[]).length; idx++){
+        const name=(srcSeq.frameNames||[])[idx];
         const blob=(srcSeq.blobs||[])[idx] || null;
         if(blob){
           const url=URL.createObjectURL(blob);
           seq.urls.push(url);
           seq.blobs.push(blob);
           seq.frameNames.push(name);
-          seq.frames.push(PIXI.Texture.from(url));
+          seq.frames.push(await loadTextureFromUrl(url));
         }else{
           seq.urls.push(null);
           seq.blobs.push(null);
           seq.frameNames.push(name);
-          seq.frames.push((srcSeq.frames||[])[idx] || PIXI.Texture.from(name));
+          seq.frames.push((srcSeq.frames||[])[idx] || PIXI.Texture.WHITE);
         }
-      });
+      }
       return seq;
     }
 
-    function duplicateEmitter(i){
+    async function duplicateEmitter(i){
       if(i<0 || i>=configs.length) return;
 
       const insertAt=i+1;
       configs.splice(insertAt,0,cloneJson(configs[i]));
-      textureAssets.splice(insertAt,0,cloneTextureAssetsForEmitter(textureAssets[i]));
-      sequences.splice(insertAt,0,cloneSequenceStateForEmitter(getSequenceState(i)));
+      textureAssets.splice(insertAt,0,await cloneTextureAssetsForEmitter(textureAssets[i]));
+      sequences.splice(insertAt,0,await cloneSequenceStateForEmitter(getSequenceState(i)));
       spawnGizmoVisible.splice(insertAt,0,spawnGizmoVisible[i] !== false);
       names.splice(insertAt,0,`${names[i] || `Emitter ${i+1}`} Copy`);
       emitters.splice(insertAt,0,null);
@@ -2130,7 +2221,7 @@ export { RandomizedAnimatedTextureBehavior };\n`;
         document.getElementById('bgFileLabel').style.display=r.value==='image'?'flex':'none';
       };
     });
-    document.getElementById('applyBgBtn').onclick=()=>{
+    document.getElementById('applyBgBtn').onclick=async()=>{
       const type=document.querySelector('input[name="bgType"]:checked').value;
       if(type==='color'){
         const col=document.getElementById('bgColor').value;
@@ -2144,11 +2235,11 @@ export { RandomizedAnimatedTextureBehavior };\n`;
           if(bgObjectUrl) URL.revokeObjectURL(bgObjectUrl);
           bgObjectUrl=URL.createObjectURL(fi.files[0]);
           if(bgSprite){ bgContainer.removeChild(bgSprite); bgSprite.destroy(); }
-          bgSprite=new PIXI.Sprite(PIXI.Texture.from(bgObjectUrl));
+          bgSprite=new PIXI.Sprite(await loadTextureFromUrl(bgObjectUrl));
           bgSprite.anchor.set(0.5);
           bgSprite.position.set(app.screen.width/2,app.screen.height/2);
           bgContainer.addChild(bgSprite);
-          bgSprite.interactive=true; bgSprite.cursor='move';
+          bgSprite.eventMode='static'; bgSprite.cursor='move';
           let offset={x:0,y:0};
           bgSprite.on('pointerdown',e=>{
             const pos=e.getLocalPosition(bgContainer);
@@ -2172,6 +2263,9 @@ export { RandomizedAnimatedTextureBehavior };\n`;
       emitterContainer.position.set(app.screen.width/2,app.screen.height/2);
     });
 
+    } catch(err) {
+      showStartupError(err);
+    }
   </script>
 </body>
 </html>
